@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VIP Microlino - Wi-Fi control</title>
+<!-- MQTT client for the browser (talks to the broker over secure WebSockets) -->
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+  :root { --bg:#0f1720; --card:#18222e; --text:#e8eef4; --muted:#8a9aab;
+          --green:#2fbf71; --red:#e5484d; --blue:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif;
+         background:var(--bg); color:var(--text); }
+  main { max-width:420px; margin:0 auto; padding:24px 18px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; justify-content:space-between; padding:6px 0; }
+  .row span:first-child { color:var(--muted); }
+  button { width:100%; padding:16px; font-size:1.05rem; font-weight:600;
+           border:0; border-radius:12px; color:white; margin-bottom:10px; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  #unlock { background:var(--green); }
+  #lock   { background:var(--red); }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%;
+         background:var(--red); margin-right:6px; }
+  .dot.on { background:var(--green); }
+  #log { font-family: ui-monospace, monospace; font-size:.8rem; color:var(--muted);
+         white-space:pre-wrap; max-height:200px; overflow:auto; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VIP Microlino</h1>
+  <p class="sub">Wi-Fi / MQTT control</p>
+
+  <button id="unlock" disabled>Unlock</button>
+  <button id="lock" disabled>Lock</button>
+
+  <div class="card">
+    <div class="row"><span>Broker</span><span><span id="dBroker" class="dot"></span><span id="sBroker">Connecting...</span></span></div>
+    <div class="row"><span>Car</span><span><span id="dCar" class="dot"></span><span id="sCar">Waiting...</span></span></div>
+    <div class="row"><span>Lock</span><span id="sLock">-</span></div>
+    <div class="row"><span>Door</span><span id="sDoor">-</span></div>
+    <div class="row"><span>Last event</span><span id="sEvent">-</span></div>
+    <div class="row"><span>Session</span><span id="sSession">-</span></div>
+    <div class="row"><span>Last state</span><span id="sAge">never</span></div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</main>
+
+<script>
+// ---------------------------------------------------------------- Config ----
+// Must match TOPIC_BASE in the ESP32 code.
+const TOPIC_BASE    = "vip-microlino/demo/20261102-a19d6f";
+const TOPIC_COMMAND = TOPIC_BASE + "/command";
+const TOPIC_STATE   = TOPIC_BASE + "/state";
+
+// Same public broker as the ESP32, but over secure WebSockets (needed on https pages)
+const BROKER_URL = "wss://broker.emqx.io:8084/mqtt";
+
+const DEADLINE_AHEAD_MS = 8000;   // command valid for 8 s (ESP32 allows up to 15 s)
+const CAR_TIMEOUT_MS    = 6000;   // no state for 6 s -> show car offline
+
+// ---------------------------------------------------------------- State -----
+let latest     = null;  // last state message from the car
+let receivedAt = 0;     // when we got it (browser clock)
+let nextSeq    = 1;
+
+const $ = id => document.getElementById(id);
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent = `${t}  ${msg}\n` + $("log").textContent;
+}
+
+function carOnline() {
+  return latest && (Date.now() - receivedAt < CAR_TIMEOUT_MS);
+}
+
+function updateView() {
+  const online = carOnline();
+  $("dCar").classList.toggle("on", online);
+  $("sCar").textContent = online ? "Online" : "Offline";
+  $("unlock").disabled = !online;
+  $("lock").disabled   = !online;
+  if (!latest) return;
+  $("sAge").textContent = Math.round((Date.now() - receivedAt) / 1000) + " s ago";
+  $("sLock").textContent    = latest.busy ? "Moving..." : (latest.locked ? "Locked" : "Unlocked");
+  $("sDoor").textContent    = latest.doorOpen ? "Open" : "Closed";
+  $("sEvent").textContent   = latest.event;
+  $("sSession").textContent = latest.session;
+}
+setInterval(updateView, 1000);
+
+// ----------------------------------------------------------------- MQTT -----
+if (typeof mqtt === "undefined") {
+  $("sBroker").textContent = "MQTT library failed to load";
+  throw new Error("mqtt.min.js did not load (check internet / unpkg.com)");
+}
+log("Connecting to " + BROKER_URL);
+const client = mqtt.connect(BROKER_URL, {
+  clientId: "vip-web-" + Math.random().toString(16).slice(2, 10),
+  clean: true,
+  reconnectPeriod: 3000
+});
+
+client.on("connect", () => {
+  $("dBroker").classList.add("on");
+  $("sBroker").textContent = "Connected";
+  client.subscribe(TOPIC_STATE, { qos: 0 });
+  log("Broker connected, waiting for car state...");
+});
+
+client.on("reconnect", () => log("Retrying broker..."));
+
+client.on("close", () => {
+  $("dBroker").classList.remove("on");
+  $("sBroker").textContent = "Disconnected";
+});
+
+client.on("error", err => log("Broker error: " + err.message));
+
+client.on("message", (topic, payload) => {
+  if (topic !== TOPIC_STATE) return;
+  let s;
+  try { s = JSON.parse(payload.toString()); }
+  catch { log("Got a state message that is not valid JSON: " + payload.toString().slice(0, 80)); return; }
+  if (!latest) log("First state received from the car");
+
+  // New session (ESP32 rebooted or reconnected) -> restart our counter
+  if (!latest || s.session !== latest.session) {
+    log(`Car session ${s.session}`);
+    nextSeq = 1;
+  }
+  // Never reuse a number the car already accepted
+  nextSeq = Math.max(nextSeq, s.seq + 1);
+
+  if (latest && s.event !== latest.event && s.event.startsWith("REJECT_")) {
+    log("Car refused: " + s.event);
+  }
+
+  latest = s;
+  receivedAt = Date.now();
+  updateView();
+});
+
+// -------------------------------------------------------------- Command -----
+function send(action) {
+  if (!carOnline()) { log("Car is offline"); return; }
+
+  // Estimate the ESP32's millis() right now:
+  // its clock when it sent the last state + time passed since we got it
+  const carNow   = latest.ms + (Date.now() - receivedAt);
+  const deadline = Math.round(carNow + DEADLINE_AHEAD_MS);
+  const seq      = nextSeq++;
+
+  const command = `${latest.session}|${seq}|${deadline}|${action}`;
+  client.publish(TOPIC_COMMAND, command, { qos: 0, retain: false });
+  log("Sent " + command);
+}
+
+$("unlock").onclick = () => send("UNLOCK");
+$("lock").onclick   = () => send("LOCK");
+</script>
+</body>
+</html>
