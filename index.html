@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VIP Microlino</title>
+<style>
+  :root { --bg:#0f1720; --card:#18222e; --text:#e8eef4; --muted:#8a9aab;
+          --green:#2fbf71; --red:#e5484d; --blue:#3b82f6; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif;
+         background:var(--bg); color:var(--text); }
+  main { max-width:420px; margin:0 auto; padding:24px 18px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .card { background:var(--card); border-radius:14px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; justify-content:space-between; padding:6px 0; }
+  .row span:first-child { color:var(--muted); }
+  button { width:100%; padding:16px; font-size:1.05rem; font-weight:600;
+           border:0; border-radius:12px; color:white; margin-bottom:10px; cursor:pointer; }
+  button:disabled { opacity:.4; cursor:default; }
+  #connect { background:var(--blue); }
+  #unlock  { background:var(--green); }
+  #lock    { background:var(--red); }
+  #log { font-family: ui-monospace, monospace; font-size:.8rem; color:var(--muted);
+         white-space:pre-wrap; max-height:160px; overflow:auto; }
+  .warn { background:#3a2a12; color:#f5c26b; }
+</style>
+</head>
+<body>
+<main>
+  <h1>VIP Microlino</h1>
+  <p class="sub">Car <b id="carName">-</b></p>
+
+  <div id="unsupported" class="card warn" hidden>
+    This browser has no Web Bluetooth. Use Chrome on Android
+    (or the Bluefy browser on iPhone).
+  </div>
+
+  <button id="connect">Connect to car</button>
+  <button id="unlock" disabled>Unlock</button>
+  <button id="lock" disabled>Lock</button>
+
+  <div class="card">
+    <div class="row"><span>Connection</span><span id="sConn">Not connected</span></div>
+    <div class="row"><span>Lock</span><span id="sLock">-</span></div>
+    <div class="row"><span>Door</span><span id="sDoor">-</span></div>
+    <div class="row"><span>Last event</span><span id="sEvent">-</span></div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</main>
+
+<script>
+// ---------------------------------------------------------------- Config ----
+// DEMO ONLY: in the real system this key lives on your server, never in the page.
+const SHARED_KEY = "change-me-to-a-long-random-secret";   // same as in the .ino
+
+const SERVICE_UUID = "7f1e0001-4b5a-4c3d-9e2f-1a2b3c4d5e6f";
+const NONCE_UUID   = "7f1e0002-4b5a-4c3d-9e2f-1a2b3c4d5e6f";
+const COMMAND_UUID = "7f1e0003-4b5a-4c3d-9e2f-1a2b3c4d5e6f";
+const STATE_UUID   = "7f1e0004-4b5a-4c3d-9e2f-1a2b3c4d5e6f";
+
+// Car id comes from the QR link:  .../index.html?car=MICRO-01
+const CAR_ID = new URLSearchParams(location.search).get("car") || "MICRO-01";
+
+// ---------------------------------------------------------------- State -----
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+let device, nonceChar, commandChar, stateChar;
+
+const $ = id => document.getElementById(id);
+$("carName").textContent = CAR_ID;
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent = `${t}  ${msg}\n` + $("log").textContent;
+}
+
+function setButtons(connected) {
+  $("connect").disabled = connected;
+  $("unlock").disabled  = !connected;
+  $("lock").disabled    = !connected;
+  $("sConn").textContent = connected ? "Connected" : "Not connected";
+}
+
+// Chrome allows only one Bluetooth operation at a time, so we queue them.
+let gattQueue = Promise.resolve();
+function gatt(task) {
+  const result = gattQueue.then(task);
+  gattQueue = result.catch(() => {});
+  return result;
+}
+
+// ----------------------------------------------------------------- HMAC -----
+async function hmacHex(key, message) {
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", enc.encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const signature = await crypto.subtle.sign("HMAC", cryptoKey, enc.encode(message));
+  return [...new Uint8Array(signature)]
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ------------------------------------------------------------ Bluetooth -----
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: CAR_ID }],
+      optionalServices: [SERVICE_UUID]
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    log(`Connecting to ${device.name}...`);
+    const server  = await device.gatt.connect();
+    const service = await server.getPrimaryService(SERVICE_UUID);
+    nonceChar   = await service.getCharacteristic(NONCE_UUID);
+    commandChar = await service.getCharacteristic(COMMAND_UUID);
+    stateChar   = await service.getCharacteristic(STATE_UUID);
+
+    await stateChar.startNotifications();
+    stateChar.addEventListener("characteristicvaluechanged", () => refreshState());
+
+    setButtons(true);
+    log("Connected");
+    await refreshState();
+  } catch (err) {
+    log("Connect failed: " + err.message);
+  }
+}
+
+function onDisconnected() {
+  setButtons(false);
+  log("Disconnected");
+}
+
+async function refreshState() {
+  try {
+    const value = await gatt(() => stateChar.readValue());
+    const s = JSON.parse(dec.decode(value));
+    $("sLock").textContent  = s.busy ? "Moving..." : (s.locked ? "Locked" : "Unlocked");
+    $("sDoor").textContent  = s.doorOpen ? "Open" : "Closed";
+    $("sEvent").textContent = s.event;
+  } catch (err) {
+    // a read can fail during disconnect; ignore
+  }
+}
+
+async function send(action) {
+  try {
+    // 1. fresh one-time number from the car
+    const nonce = dec.decode(await gatt(() => nonceChar.readValue()));
+    // 2. sign it  (later: ask your server to do this step)
+    const mac = await hmacHex(SHARED_KEY, `${nonce}|${action}|${CAR_ID}`);
+    // 3. send the signed command
+    await gatt(() => commandChar.writeValueWithResponse(enc.encode(`${action}|${mac}`)));
+    log(`Sent ${action}`);
+  } catch (err) {
+    log(`${action} failed: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------- Wiring ----
+if (!navigator.bluetooth) {
+  $("unsupported").hidden = false;
+  $("connect").disabled = true;
+}
+$("connect").onclick = connect;
+$("unlock").onclick  = () => send("UNLOCK");
+$("lock").onclick    = () => send("LOCK");
+</script>
+</body>
+</html>
